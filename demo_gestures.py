@@ -17,8 +17,9 @@ def demo_gestures():
 
     print("\n🤏 Single Hand Gestures:")
     single_hand = [
-        "Fist", "Open Hand", "Peace", "Thumbs Up", "Thumbs Down",
-        "One", "Three", "Four", "OK", "Rock", "Call Me", "Point Up"
+        "Fist", "Open Hand", "Thumbs Up", "Thumbs Down",
+        "One", "Two", "Three", "Four", "Five",
+        "OK", "Call Me", "Point Up",
     ]
 
     for gesture in single_hand:
@@ -26,9 +27,19 @@ def demo_gestures():
             khmer, english = GESTURE_KHMER[gesture]
             print(f"  {gesture:12} → {khmer} ({english})")
 
-    print("\n🤝 Two-Hand Phrase Gestures:")
+    print("\n🤝 CSL Phrase Gestures (one hand):")
+    single_phrase = [
+        "How Are You", "Wrong", "Understand", "Hearing", "Deaf", "Sorry",
+    ]
+    for gesture in single_phrase:
+        if gesture in GESTURE_KHMER:
+            khmer, english = GESTURE_KHMER[gesture]
+            print(f"  {gesture:14} → {khmer} ({english})")
+
+    print("\n🤝 CSL Phrase Gestures (two hands):")
     two_hand = [
-        "Hello", "How Are You", "Where From", "Thank You", "Please", "Sorry"
+        "Thank You", "Again", "Right", "Congratulation",
+        "Please", "Hello", "Where From",
     ]
 
     for gesture in two_hand:

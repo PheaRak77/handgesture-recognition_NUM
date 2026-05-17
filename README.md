@@ -10,22 +10,30 @@ A real-time gesture recognition application that detects hand gestures and displ
 - Multi-threaded camera processing
 - Demo mode for testing with video files
 
-## How to Use Two-Hand Gestures
+## CSL phrase gestures (from reference charts)
 
-The app now supports **phrase gestures** using both hands simultaneously:
+### One hand
+| Gesture | Khmer | How to sign |
+|---------|-------|-------------|
+| **How Are You** | សុខសប្បាយ | Thumb up at chest |
+| **Wrong** | ខុស | Index finger toward cheek |
+| **Understand** | យល់ | Index finger at temple |
+| **Hearing** | ស្តាប់ឮ | Index finger toward ear |
+| **Deaf** | ថ្លង់ | Index toward ear or mouth |
+| **Sorry** | សុំទោស | One flat hand on chest, small rub |
 
-1. **Hello** (សួស្តី): Hold both hands open, palms facing each other like a greeting
-2. **How Are You** (សុខសប្បាយជា): One hand open palm up, the other hand pointing up
-3. **Where From** (មកពីណា): Both hands pointing, or one pointing and one open
-4. **Thank You** (អរគុណ): Bring both open hands together in a prayer position
-5. **Please** (សូម): Hold both hands open with palms facing up
-6. **Sorry** (សុំទោស): Cross your open hands over your chest
+### Two hands
+| Gesture | Khmer | How to sign |
+|---------|-------|-------------|
+| **Thank You** | អរគុណ | Left palm up; right hand taps down on left palm |
+| **Again** | ម្តងទៀត | Same as thank, then small side-to-side rub on palm |
+| **Right** | ត្រូវ | Both index fingers up; right index above left, tap down |
+| **Congratulation** | អបអរសាទរ | Both hands up at shoulders, palms forward, fingers spread |
+| **Please** | សូម | Both palms up, arms apart |
+| **Hello** | សួស្តី | Both hands open, same height, apart |
+| **Where From** | មកពីណា | Both point up, or one point + one open palm |
 
-**Tips:**
-- Make sure both hands are visible to the camera
-- Hold the gesture steady for 1-2 seconds for best recognition
-- The app prioritizes two-hand gestures when both hands are detected
-- If only one hand is detected, it will show single-hand gestures
+**Tips:** Both hands must be visible for two-hand signs. Hold each pose 1–2 seconds.
 
 ## Setup
 
@@ -60,6 +68,25 @@ python3 demo_gestures.py
 python3 main.py --help
 ```
 
+### PostgreSQL logging
+```bash
+# 1. Copy env.example to .env and set your pgAdmin database (e.g. db_num_project)
+# 2. Seed gestures in pgAdmin: run database/02_seed_gestures.sql
+# 3. Test connection
+python scripts/test_db.py
+
+# 4. Run with database logging
+python main.py --db
+```
+
+When a gesture changes, one row is inserted into `gesture_events`. View in pgAdmin:
+```sql
+SELECT g.name_en, g.text_khmer, e.detected_at
+FROM gesture_events e
+JOIN gestures g ON g.id = e.gesture_id
+ORDER BY e.detected_at DESC;
+```
+
 ## Controls
 
 - **Press 'q' in any camera window to quit** (click on the window first to focus it)
@@ -73,6 +100,8 @@ python3 main.py --help
 - MediaPipe
 - NumPy
 - Pillow
+- PostgreSQL (optional, for `--db` logging)
+- psycopg2-binary, python-dotenv (optional)
 - A camera (webcam) for live mode
 - Khmer font (Hanuman.ttf included)
 
@@ -86,19 +115,4 @@ python3 main.py --help
 - **Import errors**: Make sure all dependencies are installed in the virtual environment
 - **Font issues**: The app includes a Khmer font, but system fonts will be used as fallback
 
-## Project Structure
-
-```
-.
-├── main.py                 # Main application
-├── requirements.txt        # Python dependencies
-├── assets/
-│   └── fonts/
-│       └── Hanuman.ttf     # Khmer font
-├── src/
-│   ├── gesture_engine.py   # Gesture detection logic
-│   ├── khmer_text.py       # Khmer text rendering
-│   └── __init__.py
-├── data/                   # Data files (empty)
-└── models/                 # Model files (empty)
 ```

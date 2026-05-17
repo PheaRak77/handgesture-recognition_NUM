@@ -1,4 +1,6 @@
 opencv-python
-mediapipe==0.10.21
+mediapipe==0.10.35
 numpy
 Pillow
+psycopg2-binary
+python-dotenv

@@ -1,0 +1,25 @@
+# Per-camera gesture detection settings.
+# Run: python scripts/collect_landmarks.py --camera 0
+# Then: python scripts/train_classifier.py
+
+defaults:
+  min_phrase_frames: 2    # frames to confirm gesture (~66ms at 30fps — fastest stable response)
+  min_hold_frames: 2      # frames with no hand before phrase clears
+  ml_confidence: 0.55     # minimum ML probability (0–1)
+  mirror: false
+  use_ml: true            # use ML when models/gesture_classifier.joblib exists
+
+cameras:
+  "0":
+    mirror: false
+    min_phrase_frames: 2
+    min_hold_frames: 2
+  "1":
+    mirror: true            # typical for phone / front-facing camera
+    min_phrase_frames: 2
+    min_hold_frames: 2
+  "2":
+    mirror: false
+    min_phrase_frames: 2    # Logitech external webcam — instant response
+    min_hold_frames: 2
+

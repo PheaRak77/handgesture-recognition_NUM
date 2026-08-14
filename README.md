@@ -79,6 +79,29 @@ python scripts/test_db.py
 python main.py --db
 ```
 
+### Train smarter gesture detection (ML)
+
+The app uses **MediaPipe landmarks + a trained classifier** (with rule-based fallback).
+Per-camera settings live in `config/cameras.yaml` (mirror, smoothing, ML threshold).
+
+```bash
+source venv/bin/activate
+pip install -r requirements.txt
+
+# 1. Record samples (50+ per gesture recommended)
+python scripts/collect_landmarks.py --camera 0
+#    [ / ] = change gesture label   SPACE = record 30 frames   q = quit
+
+# 2. Train classifier → models/gesture_classifier.joblib
+python scripts/train_classifier.py
+
+# 3. Run live (ML loads automatically when model exists)
+python main.py --camera 0
+python main.py --camera 1   # phone cam — mirror settings in cameras.yaml
+```
+
+Edit `config/cameras.yaml` to tune `min_phrase_frames`, `ml_confidence`, and `mirror` per camera.
+
 When a gesture changes, one row is inserted into `gesture_events`. View in pgAdmin:
 ```sql
 SELECT g.name_en, g.text_khmer, e.detected_at

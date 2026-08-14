@@ -1,4 +1,3 @@
-cat << 'EOF' > .gitignore
 __pycache__/
 *.py[cod]
 venv/
@@ -6,4 +5,5 @@ venv/
 *.h5
 *.pkl
 .DS_Store
-EOF
+data/landmarks/
+models/*.joblib

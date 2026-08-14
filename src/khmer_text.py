@@ -251,23 +251,44 @@ def _blend_bgra_onto_bgr(frame: np.ndarray, overlay: np.ndarray, x: int, y: int)
     patch = overlay[oy0:oy1, ox0:ox1]
     region = frame[y0:y1, x0:x1]
 
-    text_mask = patch[:, :, :3].any(axis=2)
-    if not text_mask.any():
-        return
-
-    region[text_mask] = patch[text_mask, :3][:, ::-1]  # BGRA -> BGR
+    # Vectorized alpha blending for smooth anti-aliased edges
+    alpha = (patch[:, :, 3] / 255.0)[:, :, np.newaxis]
+    region[:, :] = ((1.0 - alpha) * region + alpha * patch[:, :, :3]).astype(np.uint8)
 
 
-def _put_khmer_text_pil(image, text, position, font_path, font_size, color):
-    img_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(img_pil)
+_pil_text_cache: dict[tuple, np.ndarray] = {}
+
+def _pil_render_text(text: str, font_path: str, font_size: int, color_rgb) -> np.ndarray:
     path, _ = _resolve_khmer_font(font_path)
     try:
         font = ImageFont.truetype(path, font_size)
     except (IOError, OSError):
         font = ImageFont.load_default()
-    draw.text(position, text, font=font, fill=color)
-    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+    # Measure text size using a dummy image
+    dummy_img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    dummy_draw = ImageDraw.Draw(dummy_img)
+    try:
+        bbox = dummy_draw.textbbox((0, 0), text, font=font)
+        w = max(bbox[2] - bbox[0] + 16, 1)
+        h = max(bbox[3] - bbox[1] + 16, 1)
+        offset_x = bbox[0]
+        offset_y = bbox[1]
+    except Exception:
+        # Fallback for old PIL versions
+        w, h = 500, 60
+        offset_x, offset_y = 0, 0
+
+    # Create the transparent text bitmap
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    # Draw text with 8-pixel padding
+    draw.text((8 - offset_x, 8 - offset_y), text, font=font, fill=color_rgb)
+
+    rgba = np.array(img)
+    # Convert RGBA (Pillow format) to BGRA (OpenCV format)
+    bgra = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
+    return bgra
 
 
 _gdi_text_cache: dict[tuple, np.ndarray] = {}
@@ -276,25 +297,33 @@ _gdi_text_cache: dict[tuple, np.ndarray] = {}
 def put_khmer_text(image, text, position, font_path,
                    font_size: int = 25, color=(0, 255, 0)):
     """Render Khmer Unicode onto a BGR OpenCV image."""
+    color_tuple = tuple(color)
+    cache_key = (text, font_path, font_size, color_tuple)
+
     if sys.platform == "win32":
         path, face = _resolve_khmer_font(font_path)
         if path:
             _ensure_private_font(path)
-        else:
-            print(
-                "[khmer_text] WARNING: No Khmer font file found; using system Khmer UI.",
-                flush=True,
-            )
         try:
-            cache_key = (text, face, font_size, color)
             bgra = _gdi_text_cache.get(cache_key)
             if bgra is None:
-                bgra = _win32_render_text(text, face, font_size, color)
+                bgra = _win32_render_text(text, face, font_size, color_tuple)
                 _gdi_text_cache[cache_key] = bgra
             out = image.copy()
             _blend_bgra_onto_bgr(out, bgra, position[0], position[1])
             return out
         except Exception as exc:
-            print(f"[khmer_text] GDI render failed ({exc}); falling back to PIL.", flush=True)
+            pass
 
-    return _put_khmer_text_pil(image, text, position, font_path, font_size, color)
+    # Linux / macOS / Fallback with ultra-fast cached PIL rendering
+    try:
+        bgra = _pil_text_cache.get(cache_key)
+        if bgra is None:
+            bgra = _pil_render_text(text, font_path, font_size, color_tuple)
+            _pil_text_cache[cache_key] = bgra
+        out = image.copy()
+        _blend_bgra_onto_bgr(out, bgra, position[0], position[1])
+        return out
+    except Exception as exc:
+        print(f"[khmer_text] PIL render failed: {exc}", flush=True)
+        return image

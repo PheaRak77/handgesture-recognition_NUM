@@ -1,10 +1,15 @@
+# pyrefly: ignore [missing-import]
 import cv2
 import os
 import threading
 import argparse
 import signal
 import sys
+import time
+# pyrefly: ignore [missing-import]
+import numpy as np
 
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
 from src.gesture_engine import GestureEngine, GESTURE_KHMER
@@ -12,6 +17,17 @@ from src.khmer_text import put_khmer_text
 from src.db import GestureDatabase
 
 load_dotenv()
+
+# Suppress libjpeg "Corrupt JPEG data" warnings from MJPG webcam streams.
+# These are harmless (frames still decode correctly). All useful output
+# goes through print() to stdout (fd 1), so redirecting stderr is safe.
+if sys.platform.startswith("linux"):
+    try:
+        _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(_devnull_fd, 2)
+        os.close(_devnull_fd)
+    except OSError:
+        pass
 
 # ─────────────────────────────────────────────
 # Configuration
@@ -41,8 +57,97 @@ signal.signal(signal.SIGTERM, signal_handler)
 # ─────────────────────────────────────────────
 # Open a single camera by index
 # ─────────────────────────────────────────────
+def _try_init_camera(idx: int, backend, force_mjpg: bool):
+    try:
+        cap = cv2.VideoCapture(idx, backend)
+    except Exception:
+        try:
+            cap = cv2.VideoCapture(idx)
+        except Exception:
+            return None
+
+    if cap is None or not cap.isOpened():
+        return None
+
+    # Set properties before reading any frames to ensure proper initialization
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
+    if force_mjpg:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+    # Disable auto-exposure priority on Linux to prevent camera dropping FPS in low light
+    if sys.platform.startswith("linux"):
+        import subprocess
+        try:
+            subprocess.run(
+                ["v4l2-ctl", "-d", f"/dev/video{idx}", "-c", "exposure_auto_priority=0", "-c", "exposure_dynamic_framerate=0"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass
+
+    # Read 3 frames to verify the stream is active and not failing
+    success = True
+    for _ in range(3):
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            success = False
+            break
+        time.sleep(0.01)
+
+    if success:
+        print(f" Camera {idx} opened successfully (MJPG={force_mjpg})", flush=True)
+        return cap
+
+    cap.release()
+    return None
+
+
+def is_video_capture_device(idx: int) -> bool:
+    if not sys.platform.startswith("linux"):
+        return True
+    import subprocess
+    try:
+        # Check device capabilities using v4l2-ctl
+        res = subprocess.run(
+            ["v4l2-ctl", "-d", f"/dev/video{idx}", "--info"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1.0
+        )
+        if res.returncode != 0:
+            return False
+
+        # Look for Device Caps section and verify it contains "Video Capture"
+        lines = res.stdout.splitlines()
+        device_caps_active = False
+        for line in lines:
+            if "Device Caps" in line:
+                device_caps_active = True
+                continue
+            if device_caps_active:
+                if not line.strip() or ":" in line:
+                    break
+                if "Video Capture" in line:
+                    return True
+        return False
+    except Exception:
+        # Fallback to True if v4l2-ctl is not installed or error occurs
+        return True
+
+
 def open_camera(idx: int):
-    # Prefer OS-native backends to avoid noisy fallbacks (e.g. FFMPEG index errors).
+    # Skip Linux V4L2 metadata/control channels (e.g. /dev/video1 or /dev/video3)
+    if not is_video_capture_device(idx):
+        print(f" ⚠️ Skipping Camera {idx} (Metadata / Control device channel)", flush=True)
+        return None
+
+    # Prefer OS-native backends to avoid noisy fallbacks
     backends = []
     if sys.platform.startswith("linux"):
         backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
@@ -52,23 +157,15 @@ def open_camera(idx: int):
         backends = [cv2.CAP_ANY]
 
     for backend in backends:
-        try:
-            cap = cv2.VideoCapture(idx, backend)
-        except Exception:
-            cap = cv2.VideoCapture(idx)
-
-        if cap is None or not cap.isOpened():
-            continue
-
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            print(f" Camera {idx} opened", flush=True)
+        # Try 1: with MJPG format (high speed for external webcams)
+        cap = _try_init_camera(idx, backend, force_mjpg=True)
+        if cap is not None:
             return cap
 
-        cap.release()
+        # Try 2: default format (fallback for laptop built-in/raw webcams)
+        cap = _try_init_camera(idx, backend, force_mjpg=False)
+        if cap is not None:
+            return cap
 
     return None
 
@@ -82,41 +179,73 @@ def detect_all_cameras(indices=None):
     return found
 
 
+# Cache pre-rendered gesture label bars to avoid redundant blending every frame.
+# key: (gesture_name, frame_width) -> annotated bar numpy array
+_overlay_cache: dict[tuple, object] = {}
+
+
 def draw_gesture_overlay(frame, gestures, draw_khmer=True):
     h, w = frame.shape[:2]
-    y = 50
+    y = 0
 
     for gesture in gestures:
         khmer_word, english_desc = GESTURE_KHMER.get(
             gesture, ("មិនស្គាល់", "Unknown")
         )
 
+        # ── Bar geometry ────────────────────────────────────────────────────
+        bar_h  = 90
+        pad    = 10
+        x1, y1 = pad, y - 8
+        x2, y2 = w - pad, y + bar_h
+        y1_c, y2_c = max(0, y1), min(h, y2)
+        x1_c, x2_c = max(0, x1), min(w, x2)
+        bw, bh = x2_c - x1_c, y2_c - y1_c
 
-        bar_h = 80
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (5, y - 5), (w - 5, y + bar_h), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+        cache_key = (gesture, w)
+        cached_bar = _overlay_cache.get(cache_key)
+        if cached_bar is None:
+            bar = np.zeros((bh, bw, 3), dtype=np.uint8)
 
-   
-        cv2.putText(frame, f"Gesture : {gesture}",
-                    (12, y + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 80), 2)
+            # Accent left border (cyan-green)
+            cv2.rectangle(bar, (0, 0), (5, bh), (0, 220, 160), -1)
 
-        cv2.putText(frame, english_desc,
-                    (12, y + 38),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            # Gesture name — large, bold, bright white
+            cv2.putText(bar, gesture,
+                        (18, 34),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
 
-        if draw_khmer:
-            frame = put_khmer_text(
-                frame,
-                f"ខ្មែរ : {khmer_word}",
-                (12, y + 50),
-                FONT_PATH,
-                font_size=22,
-                color=(0, 230, 255),
-            )
+            # English description — purple
+            cv2.putText(bar, english_desc,
+                        (18, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 0, 200), 1, cv2.LINE_AA)
 
-        y += 95
+            # Khmer text — green
+            if draw_khmer:
+                bar = put_khmer_text(
+                    bar,
+                    khmer_word,
+                    (bw - 200, 10),
+                    FONT_PATH,
+                    font_size=18,
+                    color=(0, 220, 80),
+                )
+
+            _overlay_cache[cache_key] = bar
+            cached_bar = bar
+
+        # ── Blend bar onto live frame ────────────────────────────────────────
+        sub = frame[y1_c:y2_c, x1_c:x2_c]
+        # Darken background for contrast
+        cv2.addWeighted(sub, 0.35, sub, 0.0, 0, sub)
+        # Paste cached text pixels
+        mask = cached_bar.any(axis=2)
+        sub[mask] = cached_bar[mask]
+
+        # Thin bottom separator line
+        cv2.line(frame, (x1_c, y2_c - 1), (x2_c, y2_c - 1), (0, 120, 90), 1)
+
+        y += bar_h + 16
     return frame
 
 
@@ -169,18 +298,73 @@ def _init_database(use_db: bool) -> GestureDatabase | None:
         return None
 
 
-def camera_worker(idx, cap, latest_frames, lock, stop_event, db=None, session_id=None):
-    engine = GestureEngine()
-    print(f"  📷 Camera {idx}: model ready.", flush=True)
-    last_logged = None
+def camera_worker(
+    idx,
+    cap,
+    latest_frames,
+    lock,
+    stop_event,
+    db=None,
+    session_id=None,
+    *,
+    metrics: bool = False,
+):
+    """
+    3-thread pipeline for maximum FPS:
+      Thread A (capture)   – reads frames as fast as the camera outputs them,
+                             always overwrites a single-slot buffer with the newest frame.
+      Thread B (inference) – this thread; pulls the latest frame, runs MediaPipe
+                             + gesture detection, pushes the annotated frame to display.
+    Decoupling capture from inference means cap.read() never blocks TFLite
+    and TFLite never starves the camera buffer.
+    """
+    import queue as _queue
 
-    try:
+    # Single-slot buffer: maxsize=1 means if inference is busy the old frame
+    # is discarded and only the newest frame is kept.
+    raw_slot: _queue.Queue = _queue.Queue(maxsize=1)
+
+    # ── Thread A: capture ────────────────────────────────────────────────────
+    def _capture_loop():
         while not stop_event.is_set() and not global_stop_event.is_set():
             ret, frame = cap.read()
             if not ret or frame is None:
                 print(f" Camera {idx}: read failed — stopping.", flush=True)
+                stop_event.set()
                 break
+            # Drop stale frame so inference always gets the newest one.
+            try:
+                raw_slot.get_nowait()
+            except _queue.Empty:
+                pass
+            try:
+                raw_slot.put_nowait(frame)
+            except _queue.Full:
+                pass  # inference just grabbed it; next loop will refill
 
+    capture_thread = threading.Thread(target=_capture_loop,
+                                      name=f"Cap-{idx}", daemon=True)
+
+    # ── Thread B: inference ──────────────────────────────────────────────────
+    engine = GestureEngine(camera_id=idx)
+    print(f"  📷 Camera {idx}: model ready.", flush=True)
+
+    last_logged = None
+    fps_frames = 0
+    fps_t0 = time.perf_counter()
+    fps_value = 0.0
+    lat_ms_avg = 0.0
+
+    capture_thread.start()
+
+    try:
+        while not stop_event.is_set() and not global_stop_event.is_set():
+            try:
+                frame = raw_slot.get(timeout=0.05)
+            except _queue.Empty:
+                continue
+
+            t_start = time.perf_counter() if metrics else 0.0
             frame, gestures = engine.process_frame(frame)
 
             active = [g for g in gestures if g != "No Hand"]
@@ -188,20 +372,14 @@ def camera_worker(idx, cap, latest_frames, lock, stop_event, db=None, session_id
 
             frame = draw_gesture_overlay(frame, active, draw_khmer=True)
 
-            # Camera label top-right
-            label = f"Cam {idx}"
-            (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-            cv2.putText(frame, label,
-                        (frame.shape[1] - tw - 8, 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
-
             with lock:
                 latest_frames[idx] = frame
-                
+
     except Exception as e:
         print(f"  ❌ Camera {idx} error: {e}", flush=True)
     finally:
         print(f"  🔄 Releasing camera {idx}...", flush=True)
+        capture_thread.join(timeout=2)
         cap.release()
         engine.release()
         with lock:
@@ -209,13 +387,18 @@ def camera_worker(idx, cap, latest_frames, lock, stop_event, db=None, session_id
         print(f"  ✅ Camera {idx} released.", flush=True)
 
 
+
 # ─────────────────────────────────────────────
 # Demo mode with video file
 # ─────────────────────────────────────────────
-def run_demo(video_path, db=None, session_id=None):
-    engine = GestureEngine()
+def run_demo(video_path, db=None, session_id=None, *, metrics: bool = False):
+    engine = GestureEngine(camera_id=0)
     cap = cv2.VideoCapture(video_path)
     last_logged = None
+    fps_frames = 0
+    fps_t0 = time.perf_counter()
+    fps_value = 0.0
+    lat_ms_avg = 0.0
     
     if not cap.isOpened():
         print(f"❌ Could not open video file: {video_path}")
@@ -236,12 +419,45 @@ def run_demo(video_path, db=None, session_id=None):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
                 
+            t_start = time.perf_counter() if metrics else 0.0
             frame, gestures = engine.process_frame(frame)
             
             # Filter out "No Hand" so the overlay stays clean when no hand present
             active = [g for g in gestures if g != "No Hand"]
             last_logged = _log_gesture_change(db, session_id, 0, active, last_logged)
             frame = draw_gesture_overlay(frame, active)
+
+            if metrics:
+                t_end = time.perf_counter()
+                lat_ms = (t_end - t_start) * 1000.0
+                lat_ms_avg = (0.9 * lat_ms_avg + 0.1 * lat_ms) if lat_ms_avg else lat_ms
+
+                fps_frames += 1
+                now = t_end
+                dt = now - fps_t0
+                if dt >= 1.0:
+                    fps_value = fps_frames / dt
+                    fps_frames = 0
+                    fps_t0 = now
+
+                cv2.putText(
+                    frame,
+                    f"FPS: {fps_value:.1f}",
+                    (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+                cv2.putText(
+                    frame,
+                    f"Latency: {lat_ms_avg:.1f} ms",
+                    (10, 72),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 0),
+                    2,
+                )
 
             # Demo label
             cv2.putText(frame, "Demo Mode",
@@ -279,6 +495,12 @@ def main():
         help="Log gesture detections to PostgreSQL (uses .env settings)",
     )
     parser.add_argument(
+        "--no-metrics",
+        action="store_false",
+        dest="metrics",
+        help="Hide FPS + inference latency overlay on video",
+    )
+    parser.add_argument(
         "--camera",
         type=int,
         default=0,
@@ -305,11 +527,11 @@ def main():
                 return
             if db:
                 session_id = db.start_session(mode="demo", camera_count=1)
-            run_demo(args.demo, db=db, session_id=session_id)
+            run_demo(args.demo, db=db, session_id=session_id, metrics=args.metrics)
             return
 
         indices = SCAN_CAMERA_INDICES if args.scan_cameras else [args.camera]
-        _run_cameras(db, session_id, camera_indices=indices)
+        _run_cameras(db, session_id, camera_indices=indices, metrics=args.metrics)
     finally:
         if db:
             db.end_session()
@@ -317,7 +539,7 @@ def main():
             print("  [db] Session closed.", flush=True)
 
 
-def _run_cameras(db, session_id, camera_indices=None):
+def _run_cameras(db, session_id, camera_indices=None, *, metrics: bool = False):
 
     print("🔍 Opening camera…", flush=True)
     cameras = detect_all_cameras(camera_indices)
@@ -352,6 +574,7 @@ def _run_cameras(db, session_id, camera_indices=None):
         t = threading.Thread(
             target=camera_worker,
             args=(idx, cap, latest_frames, lock, stop_event, db, session_id),
+            kwargs={"metrics": metrics},
             daemon=True,
             name=f"Cam-{idx}",
         )
@@ -371,8 +594,8 @@ def _run_cameras(db, session_id, camera_indices=None):
                 # First frames still processing (MediaPipe load) — keep UI alive
                 cv2.waitKey(1)
 
-            # Check for 'q' key press (wait 1ms)
-            key = cv2.waitKey(1) & 0xFF
+            # Wait 2ms to pump GUI events and update window with zero lag
+            key = cv2.waitKey(2) & 0xFF
             if key == ord('q') or key == 27:  # 'q' or ESC
                 print("👋 'q' pressed, shutting down...", flush=True)
                 stop_event.set()
